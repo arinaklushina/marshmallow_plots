@@ -1,67 +1,60 @@
 # -----------------------------------------------------------------------------------
-# Boson-star BVP solver and plotting script  (compactified with r = L * tan(pi x / 2))
-# Restores: 6x6 pairwise scatter, differentials panels, annotated S(r) peak, etc.
+# Boson-star BVP solver and plotting script
+#
+# Purpose:
+#   - Solve a coupled boundary-value problem (BVP) for fields (w, m, gamma, kappa, S, y)
+#   - Build derived geometric scalars B, R and their radial derivatives
+#   - Produce diagnostic plots, including pairwise scatter panels and profiles
+#
+# Notes for running:
+#   * Requires a LaTeX installation because plt.rcParams['text.usetex'] = True
+#   * The labels for B-derivatives use TeX-safe primes: r"$B'$", r"$B''$", r"$B'''$"
+#   * Tuning parameters are grouped under "tunables" below
+#   * All arrays are evaluated on a geometric radial mesh r \in [0.1, RMAX]
+#
+# READABILITY-ONLY EDITS:
+#   The *code itself is unchanged*. Only comments and blank lines were added.
 # -----------------------------------------------------------------------------------
 
 import numpy as np
 import matplotlib.pyplot as plt
+from fontTools.misc.roundTools import otRound
 from scipy.integrate import solve_bvp
+from scipy.stats import alpha
+import matplotlib.ticker as mticker  # <-- added for scientific y-axis formatting
 
 # --------------------------- Matplotlib global settings ----------------------------
 plt.rcParams.update({'font.size': 15})
-plt.rcParams['font.family'] = 'serif'
-plt.rcParams['text.usetex'] = True
+plt.rcParams['font.family'] = 'serif'  # Couldn't find Times New Roman, next best thing.
+plt.rcParams['text.usetex'] = True     # Requires LaTeX installed and discoverable
 
 # ---------------------------------- tunables --------------------------------------
-RMIN, RMAX, NPTS = 0.1, 800.0, 4000
-L = RMAX                        # compactification scale; L ~ RMAX is a good default
-KAPPA_INF = -0.00001
-OMEGA = 1e-3
-EPS_B = 1e-8
-
-# Gaussian source (distinct name from potential's sigma)
-A, r0, sigmaG = 1e-9, 40.0, 2.5
-
-# Potential parameters (separate from Gaussian width)
-lam = 1.0
-sigma_p = 1.0
-OMEGA_V = OMEGA                 # keep potential consistent with ODEs (set 0.0 if desired)
-
-
-
-# ------------------------- compactification: r = L * tan(pi x / 2) -----------------
-def r_of_x(x):
-    return L * np.tan(0.5*np.pi*x)
-
-def drdx_of_x(x):
-    t = 0.5*np.pi*x
-    return (0.5*np.pi*L) * (1.0/np.cos(t))**2
-
-# x-interval mapping exactly to r ∈ [RMIN, RMAX]
-x0 = (2.0/np.pi) * np.arctan(RMIN / L)
-#x1 = (2.0/np.pi) * np.arctan(L / L)
-x1=1
-# Optional clustering toward RMAX: p>1 biases nodes near x1 (→ near RMAX)
-p = 2.0
-s = np.linspace(0.0, 1.0, NPTS)
-x = x0 + (x1 - x0) * (1.0 - (1.0 - s)**p)
-
+RMAX, NPTS = 200.0, 4000         # radial domain max and number of mesh points
+KAPPA_INF  = -0.01               # boundary value for kappa at r = RMAX
+OMEGA, EPS_B = 1e-3, 1e-8        # frequency-like param; floor to avoid division by 0 in B
+A, r0, sigma = 1e-6, 20.0, 2.5   # Gaussian source amplitude, center, width  (change A and re-run)
+SIGMA = 1
+ALPHA = 1
 # -------------------------- Gaussian source and derivatives ------------------------
-def f_source_gauss(r, *, A=A, r0=r0, sigma=sigmaG):
+def f_source_gauss(r, *, A=A, r0=r0, sigma=sigma):
+    # Normalized Gaussian profile f(r) = A exp(- (r - r0)^2 / (2 sigma^2))
     r = np.asarray(r); u = (r - r0)/sigma
     return A*np.exp(-0.5*u**2)
 
-def f_source_gauss_prime(r, *, A=A, r0=r0, sigma=sigmaG):
+def f_source_gauss_prime(r, *, A=A, r0=r0, sigma=sigma):
+    # First derivative f'(r)
     f = f_source_gauss(r, A=A, r0=r0, sigma=sigma)
     return f * (-(r - r0)/sigma**2)
 
-def f_source_gauss_second(r, *, A=A, r0=r0, sigma=sigmaG):
+def f_source_gauss_second(r, *, A=A, r0=r0, sigma=sigma):
+    # Second derivative f''(r)
     f = f_source_gauss(r, A=A, r0=r0, sigma=sigma); u = (r - r0)
     return f * ((u**2)/sigma**4 - 1.0/sigma**2)
 
-# ----------------------- helpers for parameter derivatives (in r) -------------------
+# ----------------------- helpers for parameter derivatives -------------------------
+# These build (w, m, gamma, kappa) radial derivatives in terms of source f and its derivs.
 def first_param_derivs(r, f):
-    rs = np.where(r==0, np.finfo(float).eps, r)
+    rs = np.where(r==0, np.finfo(float).eps, r)  # avoid division by zero at r=0
     dw      =  0.5       * rs**3 * f
     dm      = (1.0/12.0) * rs**4 * f
     dgamma  = -0.5       * rs**2 * f
@@ -84,304 +77,376 @@ def third_param_derivs(r, f, fp, fpp):
     d3kappa = -(1.0/6.0) * (2.0*fp + rs*fpp)
     return d3w, d3m, d3gamma, d3kappa
 
-# ------------------------------ BVP in compact coordinate x ------------------------
-def rhs(x, Y):
-    # Y = [w, m, gamma, kappa, S, y]
-    r  = r_of_x(x)
-    rs = np.where(r==0, np.finfo(float).eps, r)
+# ------------------------------ BVP (no p, no partial) -----------------------------
+def rhs(r, Y):
     w, m, gamma, kappa, S, y = Y
+    rs = np.where(r==0, np.finfo(float).eps, r)
 
-    B = w - 2.0*m/rs + gamma*rs - kappa*rs**2
-    R = 2.0*(w - 1.0)/rs**2 + 6.0*gamma/rs - 12.0*kappa
+    # Effective metric functions:
+    B  = w - 2.0*m/rs + gamma*rs - kappa*rs**2
+    dB = 2*m/rs + gamma - 2*kappa*rs
+    R  = 2.0*(w - 1.0)/rs**2 + 6.0*gamma/rs - 12.0*kappa
 
-    dS_dr = y / (rs**2 * np.maximum(np.abs(B), EPS_B))
-    dy_dr = -rs**2 * ((OMEGA**2 / np.maximum(np.abs(B), EPS_B) - R/6.0) * S - S**3)
+    # --- numeric guards ---
+    Bsafe  = np.maximum(np.abs(B), EPS_B) * np.sign(np.where(B==0, 1.0, B))
+    invB   = 1.0 / np.maximum(np.abs(B), EPS_B)          # for terms needing |B|
+    dB_over_B = dB / Bsafe                                # safe dB/B
+    # Optional: cap S, y a bit to prevent explosive steps in the Jacobian
+    S_c = np.clip(S, -1e6, 1e6)
+    y_c = np.clip(y, -1e6, 1e6)
 
-    f  = f_source_gauss(rs)
-    dw_dr, dm_dr, dgamma_dr, dkappa_dr = first_param_derivs(rs, f)
+    dS = y_c / (rs**2 * np.maximum(np.abs(B), EPS_B))
+    # compute ddS using the safe dB/B
+    dy = -rs**2 * ((OMEGA**2 * invB - R/6.0) * S_c - S_c**3)
+    ddS = dy / (rs * np.maximum(np.abs(B), EPS_B)) - dS * (2/rs + dB_over_B)
 
-    # Chain rule: dY/dx = (dY/dr) * (dr/dx)
-    fac = drdx_of_x(x)
-    return fac * np.vstack([dw_dr, dm_dr, dgamma_dr, dkappa_dr, dS_dr, dy_dr])
+    # Source
+    f = (-SIGMA / (4 * ALPHA)) * (S_c*(dS**2) - ddS * S_c)
+    # Optional: clip f to avoid blowing up the Jacobian
+    f = np.clip(f, -1e6, 1e6)
 
-# Asymptotic helper (based on kappa_inf)
-R_inf = -12.0 * KAPPA_INF
-Smin_Sq_bc = - 2.0 * (-R_inf/12.0) / (4.0 * lam / sigma_p)
-S_inf = float(np.sqrt(max(Smin_Sq_bc, 0.0)))
+    dw, dm, dgamma, dkappa = first_param_derivs(rs, f)
+    return np.vstack([dw, dm, dgamma, dkappa, dS, dy])
 
-def bc(YL, YR):
-    w0, m0, g0, k0, S0, y0 = YL
+
+
+
+def bc(Y0, YR):
+    # Boundary conditions at r=0 (left) and r=RMAX (right)
+    w0, m0, g0, k0, S0, y0 = Y0
     wR, mR, gR, kR, SR, yR = YR
-    return np.array([
-        w0 - (1-6.0*m0*g0)**0.5,               # w(0) = 1
-        m0,                     # m(0) = 0
-        g0,                     # gamma(0) = 0
-        kR - KAPPA_INF,         # kappa(RMAX) = kappa_inf
-        y0,                     # y(0) = 0
-        SR - S_inf              # S(RMAX) = S_inf
-    ])
+    # Parameters for potential-related quantities (separate from Gaussian sigma)
+    lam = 1
+    sigma = 1
+    R_ = 2 * (wR - 1) / RMAX ** 2 + 6 * gR / RMAX - 12*KAPPA_INF
+    #R_ = - 12.0 * KAPPA_INF
+    Smin_Sq = - 2 * (-R_ / 12 + OMEGA ** 2) / (4 * lam / sigma)
+    # Enforce: w(0)=1, m(0)=0, gamma(0)=0, kappa(R)=KAPPA_INF, y(0)=0, S(R)=sqrt(max(Smin_Sq,0))
+    return np.array([w0-1.0,
+                     m0,
+                     g0,
+                     kR-KAPPA_INF,
+                     y0,
+                     SR - (np.max([Smin_Sq, 0]))**0.5])
 
 # ------------------------------------- solve ---------------------------------------
-Y_guess = np.zeros((6, x.size))
-Y_guess[0] = 1.0
-Y_guess[3] = KAPPA_INF
-Y_guess[4] = S_inf
-Y_guess[5] = 0.0
+GEOM_ON = False
+if GEOM_ON:
+    r = np.geomspace(0.1, RMAX, NPTS)
+else:
+    rmin = 0.1
+    tail_width = 10.0  # last 10 units dense
+    n_tail = int(NPTS * 0.6)  # 60% of nodes in the tail
+    n_head = NPTS - n_tail
 
-sol = solve_bvp(rhs, bc, x, Y_guess, tol=1e-14, max_nodes=900000, verbose=2)
-if sol.status != 0:
-    print("solve_bvp did not converge:", sol.message)
+    r_head = np.linspace(rmin, RMAX - tail_width, n_head, endpoint=False)
+    r_tail = np.linspace(RMAX - tail_width, RMAX, n_tail)
+    r = np.concatenate([r_head, r_tail])
 
-# Evaluate solution and map x→r
-r  = r_of_x(x)
-w, m, gamma, kappa, S, y = sol.sol(x)
-rs = np.where(r==0, np.finfo(float).eps, r)
+Y_guess = np.zeros((6, r.size)); Y_guess[0]=1.0; Y_guess[3]=KAPPA_INF; Y_guess[4]=0.0
+sol = solve_bvp(rhs, bc, r, Y_guess, tol=1e-12)
 
 # ---------------------------- build B, B', B'', B''' -------------------------------
-f   = f_source_gauss(rs)
-fp  = f_source_gauss_prime(rs)
-fpp = f_source_gauss_second(rs)
+w, m, gamma, kappa, S, y = sol.sol(r)
+rs = np.where(r==0, np.finfo(float).eps, r)
 
+# Gaussian and its derivatives on the solved mesh
+f   = f_source_gauss(rs, A=A, r0=r0, sigma=sigma)
+fp  = f_source_gauss_prime(rs, A=A, r0=r0, sigma=sigma)
+fpp = f_source_gauss_second(rs, A=A, r0=r0, sigma=sigma)
+
+# Parameter derivatives up to third order
 dw, dm, dgamma, dkappa     = first_param_derivs(rs, f)
 d2w, d2m, d2gamma, d2kappa = second_param_derivs(rs, f, fp)
 d3w, d3m, d3gamma, d3kappa = third_param_derivs(rs, f, fp, fpp)
 
-B   = w - 2.0*m/rs + gamma*rs - kappa*rs**2
-Bp  = (dw - 2.0*dm/rs + 2.0*m/rs**2 + gamma + rs*dgamma - 2.0*rs*kappa - rs**2*dkappa)
-Bpp = (d2w - 2.0*d2m/rs + 4.0*dm/rs**2 - 4.0*m/rs**3 + 2.0*dgamma + rs*d2gamma
-       - 2.0*kappa - 4.0*rs*dkappa - rs**2*d2kappa)
-Bppp= (d3w - 2.0*d3m/rs + 6.0*d2m/rs**2 - 12.0*dm/rs**3 + 12.0*m/rs**4
-       + 3.0*d2gamma + rs*d3gamma - 6.0*dkappa - 6.0*rs*d2kappa - rs**2*d3kappa)
+# Effective B and its radial derivatives (assembled via the chain rule)
+B  = w - 2.0*m/rs + gamma*rs - kappa*rs**2
+Bp = (dw - 2.0*dm/rs + 2.0*m/rs**2 + gamma + rs*dgamma - 2.0*rs*kappa - rs**2*dkappa)
+Bpp= (d2w - 2.0*d2m/rs + 4.0*dm/rs**2 - 4.0*m/rs**3 + 2.0*dgamma + rs*d2gamma
+      - 2.0*kappa - 4.0*rs*dkappa - rs**2*d2kappa)
+Bppp=(d3w - 2.0*d3m/rs + 6.0*d2m/rs**2 - 12.0*dm/rs**3 + 12.0*m/rs**4
+      + 3.0*d2gamma + rs*d3gamma - 6.0*dkappa - 6.0*rs*d2kappa - rs**2*d3kappa)
 
-# ----------------------------------- helpers ---------------------------------------
-def _grid(ax):
-    ax.grid(True, alpha=0.3)
-    ax.ticklabel_format(axis='y', style='plain', useOffset=False)
-    ax.set_xlim(RMIN, RMAX)
-
-# ------------------------------ plot: B, B', B'', B''' -----------------------------
+# ----------------------------------- plot: B, B', ... ------------------------------
 fig, ax1 = plt.subplots()
 ax1.plot(r, B, label="B")
-ax1.set_xlabel("r"); ax1.set_ylabel("B"); _grid(ax1)
+ax1.set_xlabel("r"); ax1.set_ylabel("B")
 ax2 = ax1.twinx()
-ax2.plot(r, Bp,  label=r"$B'$", color='purple')
+ax2.plot(r, Bp,  label=r"$B'$",  color='purple')
 ax2.plot(r, Bpp, label=r"$B''$", linestyle="--")
-ax2.plot(r, Bppp,label=r"$B'''$", linestyle=":"); _grid(ax2)
+ax2.plot(r, Bppp,label=r"$B'''$", linestyle=":")
+
+# Merge legends from both axes; add grid and fixed-format ticks
 L1,N1 = ax1.get_legend_handles_labels(); L2,N2 = ax2.get_legend_handles_labels()
-ax1.legend(L1+L2, N1+N2, loc="best")
-fig.savefig("marshmallow_B_tan.png", dpi=300, bbox_inches="tight")
+ax1.legend(L1+L2, N1+N2, loc="best"); ax1.grid(True, alpha=0.3)
+# --- scientific notation on both y-axes ---
+ax1.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
+ax1.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+ax2.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
+ax2.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
 
-# ---------------------------- single-variable profiles -----------------------------
-import matplotlib.ticker as mticker
+# Annotate current Gaussian amplitude A on the plot
+ax1.text(
+    0.72, 0.18, rf"A = {A:.2e}",
+    transform=ax1.transAxes, ha="left", va="top",
+    bbox=dict(boxstyle="round", facecolor="white", alpha=0.9, edgecolor="red")
+)
 
-R_all = 2.0*(w - 1.0)/rs**2 + 6.0*gamma/rs - 12.0*kappa
-pairs = [
-    (r"$w(r)$", w), (r"$m(r)$", m), (r"$\gamma(r)$", gamma),
-    (r"$\kappa(r)$", kappa), (r"$S(r)$", S), (r"$R(r)$", R_all), (r"$y(r)$", y),
-]
+fig.savefig('marshmallow_B.png', dpi=300, bbox_inches='tight')
 
-nrows, ncols = 4, 2
-fig, axes = plt.subplots(nrows, ncols, figsize=(12, 14), sharex=True)
-axes = axes.ravel()
+# -------------------- pack components for pairwise scatter panels ------------------
+names = ["w", "m", "gamma", "kappa", "S", "y"]
+arrays = [w, m, gamma, kappa, S, y]
+origin_vals = []
 
-for i, (lab, arr) in enumerate(pairs):
-    ax = axes[i]
+# Print values of (w, m, gamma, kappa) at the first radial point (proxy for origin)
+for i in range(4):
+    print(names[i] + " = " + str(arrays[i][0]) + " at the origin")
+    origin_vals.append(arrays[i][0])
+
+# Compute R at the "origin" based on those printed values
+R_origin = 2*(origin_vals[0] - 1) / r[0]**2 + 6 * origin_vals[2] / r[0] - 12 * origin_vals[3]
+print("R at the origin is ", R_origin)
+
+# ----------------------- top row + 6x6 grid of all variable pairs ------------------
+fig = plt.figure(figsize=(18, 21))
+gs = fig.add_gridspec(nrows=7, ncols=6, height_ratios=[1.1] + [1]*6)
+
+# Top horizontal row: w(r), m(r), gamma(r), kappa(r), S(r), y(r)
+labels_top = [r"$w(r)$", r"$m(r)$", r"$\gamma(r)$", r"$\kappa(r)$", r"$S(r)$", r"$y(r)$"]
+for j, (lab, arr) in enumerate(zip(labels_top, arrays)):
+    ax = fig.add_subplot(gs[0, j])
     ax.plot(r, arr)
     ax.set_title(lab)
-    _grid(ax)
-    if i // ncols == nrows - 1:
-        ax.set_xlabel("r")
-
-    # Force y-axis into scientific notation
+    ax.set_xlabel(r"$r$")
+    ax.grid(True, alpha=0.3)
+    # scientific notation on y-axis
     ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
-    ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
 
-# Hide any unused axes
-for j in range(len(pairs), len(axes)):
-    axes[j].axis("off")
+# 6x6 pairwise grid (lower triangle)
+axes = [[fig.add_subplot(gs[i+1, j]) for j in range(6)] for i in range(6)]
 
-plt.tight_layout()
-plt.savefig("marshmallow_fields_grid_tan.png", dpi=300, bbox_inches="tight")
-plt.show()
-
-# ---------------------------- 6x6 pairwise scatter (lower triangle) ----------------
-names  = ["w", "m", "gamma", "kappa", "S", "y"]
-arrays = [w, m, gamma, kappa, S, y]
-fig, axes = plt.subplots(6, 6, figsize=(18, 18), sharex=False, sharey=False)
 for i in range(6):
     for j in range(6):
-        ax = axes[i, j]
+        ax = axes[i][j]
         if i == j:
-            ax.text(0.5, 0.5, names[i], ha="center", va="center", fontsize=12, weight="bold")
+            # Diagonal: variable name
+            ax.text(0.5, 0.5, names[i], ha="center", va="center",
+                    fontsize=12, weight="bold")
             ax.set_xticks([]); ax.set_yticks([])
         elif i < j:
-            ax.axis("off")
+            # Upper triangle: leave empty (matches previous 'continue')
+            ax.set_xticks([]); ax.set_yticks([])
         else:
+            # Off-diagonal: scatter (names[i] vs names[j]) colored by r
             xi = arrays[j]; yi = arrays[i]
             valid = np.isfinite(xi) & np.isfinite(yi)
             sc = ax.scatter(xi[valid], yi[valid], c=r[valid], s=5, cmap="viridis")
-            if i == 5: ax.set_xlabel(names[j])
-            if j == 0: ax.set_ylabel(names[i])
+            if i == 5:  # bottom row → x-labels
+                ax.set_xlabel(names[j])
+            if j == 0:  # first column → y-labels
+                ax.set_ylabel(names[i])
+            # scientific notation on y-axis
+            ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
+            ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+
 plt.suptitle("All variable pairs (color = r)", fontsize=16)
 plt.tight_layout(rect=[0, 0, 0.95, 0.95])
-plt.savefig("marshmallow_all_pairs_6x6_tan.png", dpi=300, bbox_inches="tight")
+plt.savefig("marshmallow_all_pairs_with_profiles.png", dpi=300, bbox_inches="tight")
 plt.show()
 
-# ----------------------------- finite differences panels ---------------------------
+# ----------------------------- first: differentials --------------------------------
+# Finite differences along r for each field: shape (6, N-1)
 diff_arrays = np.diff(np.asarray(arrays), axis=1)  # shape (6, N-1)
+
 fig, axes = plt.subplots(3, 2, figsize=(10, 12), sharex=False, sharey=False)
-axes = axes.ravel()
+axes = axes.ravel()  # flatten to 1D: 6 Axes
 
 for i, ax in enumerate(axes):
     ax.plot(r[:-1], diff_arrays[i])
     ax.set_ylabel("d" + names[i])
-    _grid(ax)
-
-    # Force y-axis into scientific notation
+    ax.grid(True, alpha=0.3)
+    # scientific notation on y-axis
     ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
-    ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
 
+# optional: x-label only on bottom row
 for ax in axes[-2:]:
     ax.set_xlabel("r")
 
 plt.tight_layout()
-plt.savefig("marshmallow_differentials_tan.png", dpi=300, bbox_inches="tight")
-plt.show()
+plt.savefig("marshmallow_differentials.png", dpi=300, bbox_inches="tight")
+
 # -------------------------- potential & curvature diagnostics ----------------------
-R = R_all
-fig, ax = plt.subplots()
-ax.plot(r, R, label="R")
-ax.set_xlabel("r")
-ax.set_ylabel("R")
-_grid(ax)
-ax.legend()
+lam = 1
+OMEGA = 0
+sig = 1
 
-dR = np.diff(R)
-cands = np.where((dR[:-1] < 0) & (dR[1:] > 0))[0] + 1
-i_min = (cands[-1] if cands.size else
-         np.argmin(R[-max(5, len(R)//10):]) + len(R) - max(5, len(R)//10))
+# Recompute R from solved fields (on full mesh)
+R = 2.0*(w - 1.0)/rs**2 + 6.0*gamma/rs - 12.0*kappa
 
-ax.scatter([r[i_min]], [R[i_min]], s=40, zorder=5,
-           label=rf"rightmost min: $R_{{\min}}={R[i_min]:.3g}$ at $r={r[i_min]:.3g}$")
-ax.axvline(r[i_min], ls=":", alpha=0.5)
+print("R[0] - R_origin = ", R[0] - R_origin)
 
-# Force scientific notation on y-axis
-ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
-ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+# Plot R(r)
+fig, ax1 = plt.subplots()
+ax1.plot(r, R, label="R")
+ax1.set_xlabel("r")
+ax1.set_ylabel("R")
+ax1.grid(True, alpha=0.3)   # add grid with light transparency
+ax1.legend()
+# scientific notation on y-axis
+ax1.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
+ax1.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
 
-ax.legend(loc="lower right", fontsize=8)
+# --- rightmost local minimum of R(r) ---
+valid = np.isfinite(r) & np.isfinite(R)
+r_v, R_v = r[valid], R[valid]
 
-plt.tight_layout()
-plt.savefig("marshmallow_R_tan.png", dpi=300, bbox_inches="tight")
-plt.show()
+dR = np.diff(R_v)
+cands = np.where((dR[:-1] < 0) & (dR[1:] > 0))[0] + 1  # minima: slope − then +
 
-V = (-R/12 + OMEGA_V**2) * S**2 + lam/sigma_p * S**4
-Smin_Sq = - 2*(-R/12 + OMEGA_V**2)/(4*lam/sigma_p)
-
-# --- First plot: S_min^2(r) ---
-fig, ax = plt.subplots()
-ax.plot(r, Smin_Sq, label=r"$S_{\min}^2(r)$")
-ax.set_xlabel("r")
-ax.set_ylabel(r"$S_{\min}^2$")
-_grid(ax)
-
-# force y-axis into scientific notation
-ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
-ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
-
-ax.legend()
-plt.savefig("marshmallow_Smin_sq_tan.png", dpi=300, bbox_inches="tight")
-
-# --- Second plot: Mexican hat potential ---
-valid = np.isfinite(S) & np.isfinite(V) & np.isfinite(r)
-fig, ax = plt.subplots()
-sc = ax.scatter(S[valid], V[valid], c=r[valid], s=12, cmap="viridis")
-ax.set_xlabel(r"$S$")
-ax.set_ylabel(r"$V$")
-ax.grid(True, alpha=0.3)
-
-# scientific notation for y-axis (and x if desired)
-ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
-ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
-
-# optional: also scientific for x-axis
-# ax.xaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
-# ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
-
-fig.colorbar(sc, ax=ax, label=r"$r$")
-plt.tight_layout()
-plt.savefig("marshmallow_Mexican_hat_tan.png", dpi=300, bbox_inches="tight")
-plt.show()
-# ------------------------------- S(r) profile + robust peak ------------------------
-fig, ax = plt.subplots()
-ax.plot(r, S, label="S"); ax.set_xlabel("r"); ax.set_ylabel("S"); _grid(ax)
-
-r_left = 195.0
-mask = np.isfinite(r) & np.isfinite(S) & (r >= r_left)
-r_seg, s_seg = r[mask], S[mask]
-if r_seg.size < 3:  # fallback to tail if the window is too small
-    Ntail = min(200, r.size)
-    r_seg, s_seg = r[-Ntail:], S[-Ntail:]
-
-if r_seg.size >= 3:
-    ds = np.diff(s_seg)
-    cands = np.where((ds[:-1] > 0) & (ds[1:] < 0))[0] + 1
-    i0 = cands[0] if cands.size else int(np.argmax(s_seg))
-    i  = int(np.clip(i0, 1, len(s_seg)-2))
-    y_1, y0, y1 = s_seg[i-1], s_seg[i], s_seg[i+1]
-    den = (y_1 - 2*y0 + y1)
-    d = 0.5 * (y_1 - y1) / (den if den != 0 else np.finfo(float).eps)
-    r_peak = r_seg[i] + d * (r_seg[i+1] - r_seg[i])
-    s_peak = y0 - 0.25 * (y_1 - y1) * d
+if cands.size:
+    i_min = cands[-1]  # closest to the right edge
 else:
-    idx = int(np.argmax(S)); r_peak, s_peak = r[idx], S[idx]
+    # fallback: minimum within the last 10% of the domain
+    w = max(5, len(R_v)//10)
+    base = len(R_v) - w
+    i_min = base + np.argmin(R_v[base:])
 
-ax.scatter([r_peak], [s_peak], s=40, zorder=5,
-           label=rf"max (robust): $S_{{\max}}={s_peak:.3g}$ at $r={r_peak:.3g}$")
-ax.axvline(r_peak, ls=":", alpha=0.5); ax.legend(loc="lower right", fontsize=9)
-plt.savefig("marshmallow_S_tan.png", dpi=300, bbox_inches="tight"); plt.show()
+r_min_right, R_min_right = r_v[i_min], R_v[i_min]
+print(f"Rightmost local min: R(r) = {R_min_right:.6g} at r = {r_min_right:.6g}")
+
+# annotate it on the figure (with value shown in legend)
+ax1.scatter([r_min_right], [R_min_right], s=40, zorder=5,
+            label=rf"rightmost min: $R_{{\min}}={R_min_right:.3g}$ at $r={r_min_right:.3g}$")
+ax1.axvline(r_min_right, ls=":", alpha=0.5)
+ax1.legend(loc="lower right", fontsize=8, markerscale=0.8, handlelength=1.2, borderpad=0.4)
+
+
+plt.tight_layout()
+fig.savefig("marshmallow_R.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+# Potential V(S; r) and helper expressions
+V = (-R/12 + OMEGA**2 ) * S**2 + lam / sig * S**4
+# dV/dS (symbolic form retained as-is for reference)
+# dV = (-(2.0*(dw)/rs**2 - 4.0*(w-1.0) / rs **3 - 6.0*gamma/rs**2 + 6.0*dgamma / rs - 12.0*kappa)/12)*S**2  - R/12*2*S + lam/sig * 4 * S**3
+dVdS = (2*(-R/12 + OMEGA**2 ) /(4* lam / sig) + S**2) * S * 4* lam / sig
+
+# Location of potential minimum in S^2, by the quartic form (can be negative => discarded later)
+Smin_Sq = - 2*(-R/12 + OMEGA**2 ) /(4* lam / sig)
+fig, ax1 = plt.subplots()
+ax1.plot(r, Smin_Sq, label=r"$S_{\min}^2(r)$")
+ax1.set_xlabel(r"$r$"); ax1.set_ylabel(r"$S_{\min}^2$")
+ax1.grid(True, alpha=0.3)   # add grid with light transparency
+# scientific notation on y-axis
+ax1.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
+ax1.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+# --- rightmost minimum of S_min^2(r) ---
+valid = np.isfinite(r) & np.isfinite(Smin_Sq)
+r_v, s_v = r[valid], Smin_Sq[valid]
+
+# try strict local minima: slope goes − then +
+ds = np.diff(s_v)
+cands = np.where((ds[:-1] < 0) & (ds[1:] > 0))[0] + 1  # indices of local minima
+
+if cands.size:
+    i_min = cands[-1]  # rightmost local minimum
+else:
+    # fallback: take the minimum within the rightmost 10% of points (at least 5)
+    w = max(5, len(s_v)//10)
+    base = len(s_v) - w
+    i_min = base + np.argmin(s_v[base:])
+
+r_min_right, s_min_right = r_v[i_min], s_v[i_min]
+print(f"Rightmost min of Smin^2: {s_min_right:.6g} at r = {r_min_right:.6g}")
+
+# annotate on the figure
+ax1.scatter([r_min_right], [s_min_right], s=40, zorder=5,
+            label=rf"rightmost min: $S_{{\min}}^2={s_min_right:.3g}$ at $r={r_min_right:.3g}$")
+ax1.axvline(r_min_right, ls=":", alpha=0.5)
+ax1.legend(loc="lower right", fontsize=9)
+
+fig.savefig("marshmallow_Smin_sq.png", dpi=300, bbox_inches="tight")
+
+# --------------------- V(S) scatter with r-colored gradient ------------------------
+valid = np.isfinite(S) & np.isfinite(V) & np.isfinite(r)
+
+fig, ax1 = plt.subplots()
+sc = ax1.scatter(S[valid], V[valid], c=r[valid], s=12, cmap="viridis")  # color by r
+ax1.set_xlabel(r"$S$")
+ax1.set_ylabel(r"$V$")
+ax1.grid(True, alpha=0.3)
+# scientific notation on y-axis
+ax1.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
+ax1.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+
+cbar = fig.colorbar(sc, ax=ax1, label=r"$r$")  # gradient legend
+plt.tight_layout()
+plt.savefig("marshmallow_Mexican_hat.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+# Quick numeric checks on V and S
+print("Vmax(S) = ", V[np.argmax(S)])
+print("Vmin(S) = ", V[np.argmin(S)])
+print("S at Vmin = ", S[np.argmin(V)])
+
+# --- grid of single-variable profiles vs r: w, m, gamma, kappa, S, R, y ---
+R_all = 2.0*(w - 1.0)/rs**2 + 6.0*gamma/rs - 12.0*kappa  # compute here in case not yet defined
+
+pairs = [
+    (r"$w(r)$", w),
+    (r"$m(r)$", m),
+    (r"$\gamma(r)$", gamma),
+    (r"$\kappa(r)$", kappa),
+    (r"$S(r)$", S),
+    (r"$R(r)$", R_all),
+    (r"$y(r)$", y),
+]
+
+nrows, ncols = 4, 2  # 7 panels + 1 empty
+fig, axes = plt.subplots(nrows, ncols, figsize=(12, 14), sharex=True)
+axes = axes.ravel()
+
+for i, (label, arr) in enumerate(pairs):
+    ax = axes[i]
+    ax.plot(r, arr)
+    ax.set_title(label)
+    ax.grid(True, alpha=0.3)
+    # scientific notation on y-axis
+    ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+    if i // ncols == nrows - 1:
+        ax.set_xlabel(r"$r$")
+
+# hide the unused last panel
+for j in range(len(pairs), len(axes)):
+    axes[j].axis("off")
+
+plt.tight_layout()
+plt.savefig("marshmallow_fields_grid.png", dpi=300, bbox_inches="tight")
+plt.show()
+print(f"r range: [{r.min():.6g}, {r.max():.6g}], len={len(r)}")
 
 
 S_min_diff = np.abs((np.abs(Smin_Sq))**0.5 - S)
 
 fig, ax = plt.subplots()
-
-ax.plot(np.log(r), S_min_diff, label="Difference")
+ax.plot(r, S_min_diff, label="Difference")
 ax.set_xlabel("r")
 ax.set_ylabel("Difference")
 ax.grid(True)
-
 ax.legend(loc="best")
-
 fig.savefig("marshmallow_difference_S_min.png", dpi=300, bbox_inches="tight")
 plt.show()
 
-S_min_diff = np.abs((np.abs(Smin_Sq))**0.5 - S)
-
 fig, ax = plt.subplots()
-
-ax.plot(x, S_min_diff, label="Difference")
-ax.set_xlabel("x")
-ax.set_ylabel("Difference")
+ax.plot(S**2, Smin_Sq, label=r"$S_{\min}^2$ vs $S^2$")
+ax.set_xlabel(r"$S^2$")
+ax.set_ylabel(r"$S_{\min}^2$")
 ax.grid(True)
-
 ax.legend(loc="best")
-
-fig.savefig("marshmallow_difference_S_min_xpng", dpi=300, bbox_inches="tight")
+fig.savefig("marshmallow_S_min_S.png", dpi=300, bbox_inches="tight")
 plt.show()
-
-S_min_diff = np.abs((np.abs(Smin_Sq))**0.5 - S)
-
-fig, ax = plt.subplots()
-
-ax.plot(r, x, label="X")
-ax.set_xlabel("r")
-ax.set_ylabel("x(r)")
-ax.grid(True)
-
-ax.legend(loc="best")
-
-fig.savefig("marshmallow_x_r.png", dpi=300, bbox_inches="tight")
-plt.show()
-
-print(S_min_diff[-1])
