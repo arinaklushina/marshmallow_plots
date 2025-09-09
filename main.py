@@ -35,6 +35,7 @@ OMEGA, EPS_B = 1e-3, 1e-8        # frequency-like param; floor to avoid division
 A, r0, sigma = 1e-6, 20.0, 2.5   # Gaussian source amplitude, center, width  (change A and re-run)
 SIGMA = 1
 ALPHA = 1
+LAMBDA = 1
 # -------------------------- Gaussian source and derivatives ------------------------
 def f_source_gauss(r, *, A=A, r0=r0, sigma=sigma):
     # Normalized Gaussian profile f(r) = A exp(- (r - r0)^2 / (2 sigma^2))
@@ -84,8 +85,10 @@ def rhs(r, Y):
 
     # Effective metric functions:
     B  = w - 2.0*m/rs + gamma*rs - kappa*rs**2
-    dB = 2*m/rs + gamma - 2*kappa*rs
+    dB = 2*m/rs**2 + gamma - 2*kappa*rs
     R  = 2.0*(w - 1.0)/rs**2 + 6.0*gamma/rs - 12.0*kappa
+
+
 
     # --- numeric guards ---
     Bsafe  = np.maximum(np.abs(B), EPS_B) * np.sign(np.where(B==0, 1.0, B))
@@ -97,15 +100,17 @@ def rhs(r, Y):
 
     dS = y_c / (rs**2 * np.maximum(np.abs(B), EPS_B))
     # compute ddS using the safe dB/B
-    dy = -rs**2 * ((OMEGA**2 * invB - R/6.0) * S_c - S_c**3)
-    ddS = dy / (rs * np.maximum(np.abs(B), EPS_B)) - dS * (2/rs + dB_over_B)
+    dy = -rs**2 * ((OMEGA**2 * invB - R/6.0)  - (4 * LAMBDA / SIGMA) *S_c**2) * S_c
+    ddS = dy / (rs**2 * np.maximum(np.abs(B), EPS_B)) - dS * (2/rs + dB_over_B)
 
     # Source
-    f = (-SIGMA / (4 * ALPHA)) * (S_c*(dS**2) - ddS * S_c)
+    f = (-SIGMA / (4 * ALPHA)) * (2*(dS**2) - ddS * S_c) # OMEGA != 0 => time dep-ce
+
     # Optional: clip f to avoid blowing up the Jacobian
-    f = np.clip(f, -1e6, 1e6)
+    #f = np.clip(f, -1e6, 1e6)
 
     dw, dm, dgamma, dkappa = first_param_derivs(rs, f)
+    #dB = dw - (2 * dm) / rs + (2 * m) / rs ** 2 + dgamma * rs + gamma - 2 * dkappa * rs - kappa * rs ** 2
     return np.vstack([dw, dm, dgamma, dkappa, dS, dy])
 
 
@@ -126,8 +131,9 @@ def bc(Y0, YR):
                      m0,
                      g0,
                      kR-KAPPA_INF,
-                     y0,
-                     SR - (np.max([Smin_Sq, 0]))**0.5])
+
+                     S0-10,
+                     y0])
 
 # ------------------------------------- solve ---------------------------------------
 GEOM_ON = False
@@ -170,12 +176,12 @@ Bppp=(d3w - 2.0*d3m/rs + 6.0*d2m/rs**2 - 12.0*dm/rs**3 + 12.0*m/rs**4
 
 # ----------------------------------- plot: B, B', ... ------------------------------
 fig, ax1 = plt.subplots()
-ax1.plot(r, B, label="B")
-ax1.set_xlabel("r"); ax1.set_ylabel("B")
+ax1.plot(np.log10(r), np.log10(np.abs(B-1)), label="log|B-1|")
+ax1.set_xlabel("log r"); ax1.set_ylabel("log|B-1|")
 ax2 = ax1.twinx()
-ax2.plot(r, Bp,  label=r"$B'$",  color='purple')
-ax2.plot(r, Bpp, label=r"$B''$", linestyle="--")
-ax2.plot(r, Bppp,label=r"$B'''$", linestyle=":")
+ax2.plot(np.log10(r), Bp,  label=r"$B'$",  color='purple')
+ax2.plot(np.log10(r), Bpp, label=r"$B''$", linestyle="--")
+ax2.plot(np.log10(r), Bppp,label=r"$B'''$", linestyle=":")
 
 # Merge legends from both axes; add grid and fixed-format ticks
 L1,N1 = ax1.get_legend_handles_labels(); L2,N2 = ax2.get_legend_handles_labels()
@@ -194,6 +200,19 @@ ax1.text(
 )
 
 fig.savefig('marshmallow_B.png', dpi=300, bbox_inches='tight')
+
+#-----------------------
+fig, ax = plt.subplots()
+
+ax.plot(np.log10(r), np.log10(f), label=r"$f$")
+
+ax.set_xlabel(r"$log10 r$")
+ax.set_ylabel(r"$f$")
+ax.grid(True)
+ax.legend(loc="best")
+
+fig.savefig("marshmallow_f_log10.png", dpi=300, bbox_inches="tight")
+plt.show()
 
 # -------------------- pack components for pairwise scatter panels ------------------
 names = ["w", "m", "gamma", "kappa", "S", "y"]
@@ -405,30 +424,30 @@ pairs = [
     (r"$R(r)$", R_all),
     (r"$y(r)$", y),
 ]
-
-nrows, ncols = 4, 2  # 7 panels + 1 empty
-fig, axes = plt.subplots(nrows, ncols, figsize=(12, 14), sharex=True)
-axes = axes.ravel()
-
-for i, (label, arr) in enumerate(pairs):
-    ax = axes[i]
-    ax.plot(r, arr)
-    ax.set_title(label)
-    ax.grid(True, alpha=0.3)
-    # scientific notation on y-axis
-    ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
-    ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
-    if i // ncols == nrows - 1:
-        ax.set_xlabel(r"$r$")
-
-# hide the unused last panel
-for j in range(len(pairs), len(axes)):
-    axes[j].axis("off")
-
-plt.tight_layout()
-plt.savefig("marshmallow_fields_grid.png", dpi=300, bbox_inches="tight")
-plt.show()
-print(f"r range: [{r.min():.6g}, {r.max():.6g}], len={len(r)}")
+#
+# nrows, ncols = 4, 2  # 7 panels + 1 empty
+# fig, axes = plt.subplots(nrows, ncols, figsize=(12, 14), sharex=True)
+# axes = axes.ravel()
+#
+# for i, (label, arr) in enumerate(pairs):
+#     ax = axes[i]
+#     ax.plot(r, arr)
+#     ax.set_title(label)
+#     ax.grid(True, alpha=0.3)
+#     # scientific notation on y-axis
+#     ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
+#     ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+#     if i // ncols == nrows - 1:
+#         ax.set_xlabel(r"$r$")
+#
+# # hide the unused last panel
+# for j in range(len(pairs), len(axes)):
+#     axes[j].axis("off")
+#
+# plt.tight_layout()
+# plt.savefig("marshmallow_fields_grid.png", dpi=300, bbox_inches="tight")
+# plt.show()
+# print(f"r range: [{r.min():.6g}, {r.max():.6g}], len={len(r)}")
 
 
 S_min_diff = np.abs((np.abs(Smin_Sq))**0.5 - S)
@@ -449,4 +468,56 @@ ax.set_ylabel(r"$S_{\min}^2$")
 ax.grid(True)
 ax.legend(loc="best")
 fig.savefig("marshmallow_S_min_S.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+fig, ax = plt.subplots()
+
+ax.plot(r, Smin_Sq, "--", label=r"$S_{\min}^2$")  # dashed line
+ax.plot(r, S**2, label=r"$S^2$")                       # solid line
+
+ax.set_xlabel(r"$r$")
+ax.set_ylabel(r"$S_{\min}^2,\, S^2$")
+ax.grid(True)
+ax.legend(loc="best")
+
+fig.savefig("marshmallow_S_min_sq_and_S_sq.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+fig, ax = plt.subplots()
+
+ax.plot(np.log10(r), Smin_Sq, "--", label=r"$S_{\min}^2$")  # dashed line
+ax.plot(np.log10(r), S**2, label=r"$S$")                       # solid line
+
+ax.set_xlabel(r"$log10 r$")
+ax.set_ylabel(r"$S_{\min}^2,\, S^2$")
+ax.grid(True)
+ax.legend(loc="best")
+
+fig.savefig("marshmallow_S_sq_min_and_S_sq_log10.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+fig, ax = plt.subplots()
+
+ax.plot(np.log10(r), np.log10(f), label=r"$f$")
+
+ax.set_xlabel(r"$log10 r$")
+ax.set_ylabel(r"$f$")
+ax.grid(True)
+ax.legend(loc="best")
+
+fig.savefig("marshmallow_f_log10.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+fig, ax = plt.subplots()
+
+ax.plot(r, f, label=r"$f$")
+
+ax.set_xlabel(r"$r$")
+ax.set_ylabel(r"$f$")
+ax.grid(True)
+ax.legend(loc="best")
+
+fig.savefig("marshmallow_f.png", dpi=300, bbox_inches="tight")
 plt.show()
